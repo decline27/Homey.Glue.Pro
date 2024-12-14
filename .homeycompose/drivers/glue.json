@@ -1,0 +1,59 @@
+{
+  "name": {
+    "en": "Smart Door Lock Pro"
+  },
+  "class": "lock",
+  "capabilities": [
+    "locked",
+    "measure_battery"
+  ],
+  "platforms": [
+    "local"
+  ],
+  "connectivity": [
+    "cloud"
+  ],
+  "images": {
+    "small": "/drivers/glue/assets/images/small.png",
+    "large": "/drivers/glue/assets/images/large.png"
+  },
+  "pair": [
+    {
+      "id": "list_devices",
+      "template": "list_devices",
+      "navigation": {
+        "next": "add_devices"
+      }
+    },
+    {
+      "id": "add_devices",
+      "template": "add_devices"
+    }
+  ],
+  "settings": [
+    {
+      "type": "group",
+      "label": {
+        "en": "General Settings"
+      },
+      "children": [
+        {
+          "id": "polling_interval",
+          "type": "number",
+          "label": {
+            "en": "Status Update Interval"
+          },
+          "hint": {
+            "en": "How often to check the lock status (in minutes). Default: 20 minutes"
+          },
+          "value": 20,
+          "min": 1,
+          "max": 60,
+          "units": {
+            "en": "minutes"
+          }
+        }
+      ]
+    }
+  ]
+}
