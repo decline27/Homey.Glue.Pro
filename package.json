@@ -1,9 +1,10 @@
 {
   "name": "com.gluelock.lock.pro",
   "version": "1.0.0",
-  "main": "app.ts",
+  "main": "app.js",
   "scripts": {
-    "build": "tsc"
+    "build": "homey app build",
+    "deploy": "homey app install"
   },
   "devDependencies": {
     "@tsconfig/node16": "^16.1.1",
@@ -12,9 +13,6 @@
     "typescript": "^5.2.2"
   },
   "dependencies": {
-    "@types/underscore": "^1.11.14",
-    "axios": "^1.6.1",
-    "node-fetch": "^3.3.2",
-    "underscore": "^1.13.6"
+    "axios": "^1.6.1"
   }
 }

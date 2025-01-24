@@ -1,7 +1,22 @@
 {
   "extends": "@tsconfig/node16/tsconfig.json",
   "compilerOptions": {
+    "module": "CommonJS",
+    "target": "ES2018",
+    "moduleResolution": "node",
+    "outDir": ".homeybuild",
+    "rootDir": "",
     "allowJs": true,
-    "outDir": ".homeybuild/"
-  }
+    "esModuleInterop": true,
+    "sourceMap": true,
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "include": [
+    "**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    ".homeybuild"
+  ]
 }

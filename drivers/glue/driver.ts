@@ -1,64 +1,76 @@
 import Homey from 'homey';
-import axios from 'axios';
-import _ from 'underscore';
+import { GlueApiClient } from '../../lib/api-client';
+import { LockStatus } from '../../lib/types';
 
-let lockCollection: { name: any; data: { id: any; }; }[] = [];
+interface PairDevice {
+  name: string;
+  data: {
+    id: string;
+  };
+}
 
 class GlueDriver extends Homey.Driver {
-
+  private apiClient: GlueApiClient | null = null;
+  private lockCollection: PairDevice[] = [];
 
   /**
    * onInit is called when the driver is initialized.
    */
   async onInit() {
     this.log('GlueDriver has been initialized');
-    this.loadLocksCollection();    
+    await this.initializeApiClient();
+    await this.loadLocksCollection();
   }
 
   /**
-   * onPairListDevices is called when a user is adding a device and the 'list_devices' view is called.
-   * This should return an array with the data of devices that are available for pairing.
+   * Initialize the API client with auth key
    */
-  async onPairListDevices() {    
-    return lockCollection;
+  private async initializeApiClient(): Promise<void> {
+    const glueLockAuth = this.homey.settings.get("GlueLockAuth");
+    if (!glueLockAuth) {
+      this.error('GlueLock authentication key not found in settings');
+      return;
+    }
+    this.apiClient = new GlueApiClient(glueLockAuth);
   }
 
-  public loadLocksCollection = () => {
-    // Arrange
-    var glueLockAuth = this.homey.settings.get("GlueLockAuth");
-    var options = {
-      method: 'get',
-      headers: {
-        'Authorization': `Api-Key ${glueLockAuth}`,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
+  /**
+   * onPairListDevices is called when a user is adding a device
+   * This should return an array with the data of devices that are available for pairing.
+   */
+  async onPairListDevices(): Promise<PairDevice[]> {
+    if (this.lockCollection.length === 0) {
+      await this.loadLocksCollection();
+    }
+    return this.lockCollection;
+  }
+
+  /**
+   * Load available locks from the Glue API
+   */
+  private async loadLocksCollection(): Promise<void> {
+    try {
+      if (!this.apiClient) {
+        await this.initializeApiClient();
+        if (!this.apiClient) return;
       }
-    };
 
+      const response = await this.apiClient.client.get("/locks");
+      const locks: LockStatus[] = response.data;
 
-    axios.get("https://user-api.gluehome.com/v1/locks", options)
-    .then(function (response) {
-      var responseJson = response.data;
-      
-      lockCollection = _.map(responseJson, (lock) => {
-        return {
-          "name": lock.description,
-          "data": {
-            "id": lock.id
-          }
+      this.lockCollection = locks.map(lock => ({
+        name: lock.description || `Glue Lock ${lock.id}`,
+        data: {
+          id: lock.id
         }
-      });
-      
-    })
-    .catch(function (error) {
-      console.log("ERROR", error);
-    })
-    .finally(function () {
-      // always executed
-    }); 
+      }));
 
-
-  };
+      this.log(`Loaded ${this.lockCollection.length} locks`);
+    } catch (error) {
+      this.error('Failed to load locks:', error);
+      throw error;
+    }
+  }
 }
 
 module.exports = GlueDriver;

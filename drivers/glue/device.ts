@@ -1,12 +1,14 @@
 import Homey from 'homey';
-import axios from 'axios';
-import _ from 'underscore';
+import { GlueApiClient } from '../../lib/api-client';
+import { CONFIG, EVENT_TYPES } from '../../lib/config';
+import { LockStatus, LockOperation } from '../../lib/types';
 
 class GlueDevice extends Homey.Device {
-
+  private apiClient: GlueApiClient | null = null;
   private firmwareVersion: string | null = null;
   private isFirmwareCompatible: boolean = false;
-  private readonly DEFAULT_POLLING_INTERVAL = 20; // Default polling interval in minutes
+  private lastKnownState: { locked: boolean; timestamp: string } | null = null;
+  private pollingInterval: NodeJS.Timeout | null = null;
 
   /**
    * onInit is called when the device is initialized.
@@ -14,47 +16,141 @@ class GlueDevice extends Homey.Device {
   async onInit() {
     this.log('GlueDevice has been initialized');
 
-    // Arrange
-    var self = this;
-    var deviceData = this.getData();
-    var lockId = deviceData.id;
-    var glueLockAuth = this.homey.settings.get("GlueLockAuth");
+    const deviceData = this.getData();
+    const glueLockAuth = this.homey.settings.get("GlueLockAuth");
 
     if (!glueLockAuth) {
       this.error('GlueLock authentication key not found in settings');
       return;
     }
 
-    // Register listeners:
-    this.registerCapabilityListener("locked", async (actionLock) => {
-      // Send action to device
-      this.sendActionToDevice(lockId, glueLockAuth as string, actionLock);
-    });
+    // Initialize API client
+    this.apiClient = new GlueApiClient(glueLockAuth);
 
-    // Initial firmware check and state load
-    await this.checkFirmwareVersion(lockId, glueLockAuth as string);
+    // Register listeners
+    this.registerCapabilityListener("locked", this.onLockOperation.bind(this));
 
-    // Pull status more frequently for compatible firmware
-    this.startPolling(lockId, glueLockAuth as string);
-
-    // Get latest state:
-    this.loadCurrentLockState(lockId, glueLockAuth as string);
+    // Initial setup
+    await this.checkFirmwareVersion();
+    this.startPolling();
   }
 
   /**
-   * onAdded is called when the user adds the device, called just after pairing.
+   * Handle lock/unlock operations
    */
-  async onAdded() {
-    this.log('GlueDevice has been added');
+  private async onLockOperation(locked: boolean): Promise<void> {
+    try {
+      const operation: LockOperation = { type: locked ? 'lock' : 'unlock' };
+      const lockId = this.getData().id;
+      
+      this.log(`Sending ${operation.type} command to device`);
+      await this.apiClient?.sendOperation(lockId, operation);
+      
+      // Update immediately after operation
+      await this.loadCurrentLockState();
+    } catch (error) {
+      this.error('Failed to perform lock operation:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Check and store firmware version
+   */
+  private async checkFirmwareVersion(): Promise<void> {
+    try {
+      const lockStatus = await this.apiClient?.getLockStatus(this.getData().id);
+      if (lockStatus) {
+        this.firmwareVersion = lockStatus.firmwareVersion;
+        this.isFirmwareCompatible = parseFloat(this.firmwareVersion) >= CONFIG.FIRMWARE.COMPATIBLE_VERSION;
+        this.log(`Firmware version: ${this.firmwareVersion} (Compatible: ${this.isFirmwareCompatible})`);
+      }
+    } catch (error) {
+      this.error('Failed to check firmware version:', error);
+    }
+  }
+
+  /**
+   * Load and update current lock state
+   */
+  private async loadCurrentLockState(): Promise<void> {
+    try {
+      const lockStatus = await this.apiClient?.getLockStatus(this.getData().id);
+      if (!lockStatus) return;
+
+      const deviceIsLocked = this.determineLockState(lockStatus);
+      const eventTimestamp = lockStatus.lastLockEvent.timestamp;
+
+      // Update last known state
+      this.lastKnownState = { locked: deviceIsLocked, timestamp: eventTimestamp };
+
+      // Update capabilities
+      await this.setCapabilityValue("measure_battery", lockStatus.batteryStatus);
+      await this.setCapabilityValue("locked", deviceIsLocked);
+
+      this.log(`Lock state updated: ${deviceIsLocked ? 'locked' : 'unlocked'}, Battery: ${lockStatus.batteryStatus}%`);
+    } catch (error) {
+      this.error('Failed to load lock state:', error);
+      
+      // Use last known state if available and not too old
+      if (this.lastKnownState && this.isStateValid(this.lastKnownState.timestamp)) {
+        this.log('Using last known state due to API error');
+        await this.setCapabilityValue("locked", this.lastKnownState.locked);
+      }
+    }
+  }
+
+  /**
+   * Determine lock state based on firmware version and event type
+   */
+  private determineLockState(lockStatus: LockStatus): boolean {
+    const eventType = lockStatus.lastLockEvent.eventType.toLowerCase();
+    
+    if (this.isFirmwareCompatible) {
+      return EVENT_TYPES.LOCK.includes(eventType as any);
+    }
+    
+    return !eventType.includes('unlock');
+  }
+
+  /**
+   * Check if stored state is still valid (not older than polling interval)
+   */
+  private isStateValid(timestamp: string): boolean {
+    const stateAge = Date.now() - new Date(timestamp).getTime();
+    return stateAge <= this.getPollingInterval();
+  }
+
+  /**
+   * Get polling interval in milliseconds
+   */
+  private getPollingInterval(): number {
+    const settingsInterval = this.getSetting('polling_interval') as number;
+    const minutes = Math.min(
+      Math.max(settingsInterval || CONFIG.POLLING.DEFAULT_INTERVAL, CONFIG.POLLING.MIN_INTERVAL),
+      CONFIG.POLLING.MAX_INTERVAL
+    );
+    return minutes * 60 * 1000;
+  }
+
+  /**
+   * Start polling for status updates
+   */
+  private startPolling(): void {
+    // Clear existing interval
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+      this.pollingInterval = null;
+    }
+
+    // Set new polling interval
+    this.pollingInterval = setInterval(async () => {
+      await this.loadCurrentLockState();
+    }, this.getPollingInterval());
   }
 
   /**
    * onSettings is called when the user updates the device's settings.
-   * @param {object} event the onSettings event data
-   * @param {object} event.oldSettings The old settings object
-   * @param {object} event.newSettings The new settings object
-   * @param {string[]} event.changedKeys An array of keys changed since the previous version
-   * @returns {Promise<string|void>} return a custom message that will be displayed
    */
   async onSettings({
     oldSettings,
@@ -69,12 +165,26 @@ class GlueDevice extends Homey.Device {
 
     // If polling interval was changed, restart polling
     if (changedKeys.includes('polling_interval')) {
-      const deviceData = this.getData();
-      const glueLockAuth = this.homey.settings.get("GlueLockAuth");
-      if (glueLockAuth) {
-        this.startPolling(deviceData.id, glueLockAuth as string);
-      }
+      this.startPolling();
     }
+  }
+
+  /**
+   * Clean up when device is deleted
+   */
+  async onDeleted() {
+    this.log('GlueDevice has been deleted');
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+      this.pollingInterval = null;
+    }
+  }
+
+  /**
+   * onAdded is called when the user adds the device, called just after pairing.
+   */
+  async onAdded() {
+    this.log('GlueDevice has been added');
   }
 
   /**
@@ -84,146 +194,6 @@ class GlueDevice extends Homey.Device {
    */
   async onRenamed(name: string) {
     this.log('GlueDevice was renamed');
-  }
-
-  /**
-   * onDeleted is called when the user deleted the device.
-   */
-  async onDeleted() {
-    this.log('GlueDevice has been deleted');
-  }
-
-  private async checkFirmwareVersion(lockId: string, glueLockAuth: string) {
-    if (!glueLockAuth) {
-      this.error('Cannot check firmware: GlueLock authentication key not found');
-      return;
-    }
-
-    try {
-      const options = {
-        method: 'get',
-        headers: {
-          'Authorization': `Api-Key ${glueLockAuth}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        }
-      };
-
-      const response = await axios.get(`https://user-api.gluehome.com/v1/locks/${lockId}`, options);
-      this.firmwareVersion = response.data.firmwareVersion;
-      this.isFirmwareCompatible = parseFloat(this.firmwareVersion || '0') >= 2.5;
-      
-      this.log(`Firmware version: ${this.firmwareVersion} (Compatible: ${this.isFirmwareCompatible})`);
-    } catch (error) {
-      this.error('Failed to check firmware version:', error);
-    }
-  }
-
-  /**
-   * Get polling interval in milliseconds from settings
-   */
-  private getPollingInterval(): number {
-    const settingsInterval = this.getSetting('polling_interval') as number;
-    const minutes = settingsInterval || this.DEFAULT_POLLING_INTERVAL;
-    return minutes * 60 * 1000; // Convert minutes to milliseconds
-  }
-
-  private startPolling(lockId: string, glueLockAuth: string) {
-    if (!glueLockAuth) {
-      this.error('Cannot start polling: GlueLock authentication key not found');
-      return;
-    }
-
-    // Clear any existing interval
-    if (this.getStoreValue('pollingInterval')) {
-      clearInterval(this.getStoreValue('pollingInterval'));
-    }
-
-    // Set new polling interval
-    const interval = setInterval(() => {
-      this.loadCurrentLockState(lockId, glueLockAuth);
-    }, this.getPollingInterval());
-
-    // Store the interval ID
-    this.setStoreValue('pollingInterval', interval);
-  }
-
-  public loadCurrentLockState = (lockId: string, glueLockAuth: string) => {
-    if (!glueLockAuth) {
-      this.error('Cannot load state: GlueLock authentication key not found');
-      return;
-    }
-
-    // Arrange
-    var options = {
-      method: 'get',
-      headers: {
-        'Authorization': `Api-Key ${glueLockAuth}`,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-      }
-    };
-
-    // Act
-    axios.get(`https://user-api.gluehome.com/v1/locks/${lockId}`, options)
-      .then((response) => {
-        var lockJson = response.data;
-        
-        // Determine lock state based on firmware version
-        let deviceIsLocked: boolean;
-        
-        if (this.isFirmwareCompatible) {
-          // For firmware 2.5+, properly handle all event types
-          const eventType = lockJson.lastLockEvent.eventType.toLowerCase();
-          deviceIsLocked = ['remotelock', 'manuallock', 'locallock'].includes(eventType);
-          
-          this.log(`Lock event (Firmware ${this.firmwareVersion}):`, eventType, deviceIsLocked ? 'locked' : 'unlocked');
-        } else {
-          // Legacy behavior for older firmware
-          deviceIsLocked = !(lockJson.lastLockEvent.eventType + "").toLowerCase().includes("unlock");
-          this.log(`Lock event (Legacy Firmware ${this.firmwareVersion}):`, lockJson.lastLockEvent.eventType);
-        }
-
-        this.log("Lock state", lockJson.batteryStatus, lockJson.connectionStatus, lockJson.lastLockEvent, deviceIsLocked);
-
-        this.setCapabilityValue("measure_battery", lockJson.batteryStatus);
-        this.setCapabilityValue("locked", deviceIsLocked);
-      })
-      .catch((error) => {
-        this.error("Failed to load lock state:", error);
-      });
-  }
-
-  public sendActionToDevice = (lockId: string, glueLockAuth: string, lock: boolean) => {
-    if (!glueLockAuth) {
-      this.error('Cannot send action: GlueLock authentication key not found');
-      return;
-    }
-
-    // Arrange
-    var options = {
-      method: 'post',
-      headers: {
-        'Authorization': `Api-Key ${glueLockAuth}`,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-      }
-    };
-
-    var body = {
-      "type": lock ? "lock" : "unlock"
-    };
-
-    this.log("Action taken", "LOCK", lock);
-
-    // Act
-    axios.post(`https://user-api.gluehome.com/v1/locks/${lockId}/operations`, body, options)
-      .then((response) => {
-        this.log("Command sent", response.data);
-      })
-      .catch((error) => {
-        this.error("Failed to send command:", error);
-      });
   }
 }
 
