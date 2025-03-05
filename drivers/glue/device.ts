@@ -2,25 +2,29 @@ import Homey from 'homey';
 import { GlueApiClient } from '../../lib/api-client';
 import { CONFIG, EVENT_TYPES } from '../../lib/config';
 import { LockStatus, LockOperation } from '../../lib/types';
+import { Logger, LogLevel } from '../../lib/logger';
 
-class GlueDevice extends Homey.Device {
+export class GlueDevice extends Homey.Device {
   private apiClient: GlueApiClient | null = null;
   private firmwareVersion: string | null = null;
   private isFirmwareCompatible: boolean = false;
-  private lastKnownState: { locked: boolean; timestamp: string } | null = null;
+  private lastKnownState: { locked: boolean; timestamp: string; batteryStatus: number } | null = null;
   private pollingInterval: NodeJS.Timeout | null = null;
+  private logger: Logger = new Logger(this, { prefix: 'GlueDevice' });
+  private lastOperationTime: number = 0;
+  private consecutiveErrors: number = 0;
 
   /**
    * onInit is called when the device is initialized.
    */
   async onInit() {
-    this.log('GlueDevice has been initialized');
+    this.logger.info('Device has been initialized');
 
     const deviceData = this.getData();
     const glueLockAuth = this.homey.settings.get("GlueLockAuth");
 
     if (!glueLockAuth) {
-      this.error('GlueLock authentication key not found in settings');
+      this.logger.error('Authentication key not found in settings');
       return;
     }
 
@@ -32,24 +36,45 @@ class GlueDevice extends Homey.Device {
 
     // Initial setup
     await this.checkFirmwareVersion();
+    await this.loadCurrentLockState(); // Load initial state
     this.startPolling();
   }
 
   /**
-   * Handle lock/unlock operations
+   * Handle lock/unlock operations with optimized performance
    */
   private async onLockOperation(locked: boolean): Promise<void> {
     try {
       const operation: LockOperation = { type: locked ? 'lock' : 'unlock' };
       const lockId = this.getData().id;
       
-      this.log(`Sending ${operation.type} command to device`);
+      this.logger.info(`Sending ${operation.type} command to device`);
+      
+      // Update last operation time to optimize polling
+      this.lastOperationTime = Date.now();
+      
+      // Optimistically update UI state for better responsiveness
+      await this.setCapabilityValue("locked", locked);
+      
+      // Send the actual operation to the API
       await this.apiClient?.sendOperation(lockId, operation);
       
-      // Update immediately after operation
-      await this.loadCurrentLockState();
+      // Reset consecutive errors counter on success
+      this.consecutiveErrors = 0;
+      
+      // Update state after a short delay to allow the lock to complete its operation
+      setTimeout(async () => {
+        await this.loadCurrentLockState();
+      }, 2000);
     } catch (error) {
-      this.error('Failed to perform lock operation:', error);
+      this.logger.error('Failed to perform lock operation:', error);
+      this.consecutiveErrors++;
+      
+      // Revert optimistic update if operation failed
+      if (this.lastKnownState) {
+        await this.setCapabilityValue("locked", this.lastKnownState.locked);
+      }
+      
       throw error;
     }
   }
@@ -63,15 +88,15 @@ class GlueDevice extends Homey.Device {
       if (lockStatus) {
         this.firmwareVersion = lockStatus.firmwareVersion;
         this.isFirmwareCompatible = parseFloat(this.firmwareVersion) >= CONFIG.FIRMWARE.COMPATIBLE_VERSION;
-        this.log(`Firmware version: ${this.firmwareVersion} (Compatible: ${this.isFirmwareCompatible})`);
+        this.logger.info(`Firmware version: ${this.firmwareVersion} (Compatible: ${this.isFirmwareCompatible})`);
       }
     } catch (error) {
-      this.error('Failed to check firmware version:', error);
+      this.logger.error('Failed to check firmware version:', error);
     }
   }
 
   /**
-   * Load and update current lock state
+   * Load and update current lock state with optimized caching
    */
   private async loadCurrentLockState(): Promise<void> {
     try {
@@ -82,19 +107,27 @@ class GlueDevice extends Homey.Device {
       const eventTimestamp = lockStatus.lastLockEvent.timestamp;
 
       // Update last known state
-      this.lastKnownState = { locked: deviceIsLocked, timestamp: eventTimestamp };
+      this.lastKnownState = { 
+        locked: deviceIsLocked, 
+        timestamp: eventTimestamp,
+        batteryStatus: lockStatus.batteryStatus
+      };
 
       // Update capabilities
       await this.setCapabilityValue("measure_battery", lockStatus.batteryStatus);
       await this.setCapabilityValue("locked", deviceIsLocked);
 
-      this.log(`Lock state updated: ${deviceIsLocked ? 'locked' : 'unlocked'}, Battery: ${lockStatus.batteryStatus}%`);
+      this.logger.debug(`Lock state updated: ${deviceIsLocked ? 'locked' : 'unlocked'}, Battery: ${lockStatus.batteryStatus}%`);
+      
+      // Reset consecutive errors counter on success
+      this.consecutiveErrors = 0;
     } catch (error) {
-      this.error('Failed to load lock state:', error);
+      this.logger.error('Failed to load lock state:', error);
+      this.consecutiveErrors++;
       
       // Use last known state if available and not too old
       if (this.lastKnownState && this.isStateValid(this.lastKnownState.timestamp)) {
-        this.log('Using last known state due to API error');
+        this.logger.warn('Using last known state due to API error');
         await this.setCapabilityValue("locked", this.lastKnownState.locked);
       }
     }
@@ -122,19 +155,31 @@ class GlueDevice extends Homey.Device {
   }
 
   /**
-   * Get polling interval in milliseconds
+   * Get polling interval in milliseconds with adaptive logic
    */
   private getPollingInterval(): number {
     const settingsInterval = this.getSetting('polling_interval') as number;
-    const minutes = Math.min(
+    const baseInterval = Math.min(
       Math.max(settingsInterval || CONFIG.POLLING.DEFAULT_INTERVAL, CONFIG.POLLING.MIN_INTERVAL),
       CONFIG.POLLING.MAX_INTERVAL
-    );
-    return minutes * 60 * 1000;
+    ) * 60 * 1000;
+    
+    // Adaptive polling: poll more frequently right after operations
+    const timeSinceLastOperation = Date.now() - this.lastOperationTime;
+    if (timeSinceLastOperation < 60000) { // Within 1 minute of operation
+      return Math.max(baseInterval / 4, 5000); // Poll at least every 5 seconds but no more than 1/4 of base interval
+    }
+    
+    // Back off polling frequency when experiencing errors
+    if (this.consecutiveErrors > 1) {
+      return Math.min(baseInterval * (1 + this.consecutiveErrors * 0.5), baseInterval * 5);
+    }
+    
+    return baseInterval;
   }
 
   /**
-   * Start polling for status updates
+   * Start polling for status updates with dynamic intervals
    */
   private startPolling(): void {
     // Clear existing interval
@@ -143,10 +188,20 @@ class GlueDevice extends Homey.Device {
       this.pollingInterval = null;
     }
 
-    // Set new polling interval
-    this.pollingInterval = setInterval(async () => {
-      await this.loadCurrentLockState();
-    }, this.getPollingInterval());
+    // Use setTimeout instead of setInterval for dynamic intervals
+    const scheduleNextPoll = async () => {
+      try {
+        await this.loadCurrentLockState();
+      } catch (error) {
+        // Error already logged in loadCurrentLockState
+      }
+      
+      // Schedule next poll with potentially different interval
+      this.pollingInterval = setTimeout(scheduleNextPoll, this.getPollingInterval());
+    };
+    
+    // Start the polling cycle
+    this.pollingInterval = setTimeout(scheduleNextPoll, this.getPollingInterval());
   }
 
   /**
@@ -161,7 +216,7 @@ class GlueDevice extends Homey.Device {
     newSettings: { [key: string]: boolean | string | number | undefined | null };
     changedKeys: string[];
   }): Promise<string | void> {
-    this.log("GlueDevice settings where changed");
+    this.logger.info("Settings were changed");
 
     // If polling interval was changed, restart polling
     if (changedKeys.includes('polling_interval')) {
@@ -173,18 +228,21 @@ class GlueDevice extends Homey.Device {
    * Clean up when device is deleted
    */
   async onDeleted() {
-    this.log('GlueDevice has been deleted');
+    this.logger.info('Device has been deleted');
     if (this.pollingInterval) {
-      clearInterval(this.pollingInterval);
+      clearTimeout(this.pollingInterval);
       this.pollingInterval = null;
     }
+    
+    // Clear cache when device is deleted
+    this.apiClient?.clearCache();
   }
 
   /**
    * onAdded is called when the user adds the device, called just after pairing.
    */
   async onAdded() {
-    this.log('GlueDevice has been added');
+    this.logger.info('Device has been added');
   }
 
   /**
@@ -193,7 +251,7 @@ class GlueDevice extends Homey.Device {
    * @param {string} name The new name
    */
   async onRenamed(name: string) {
-    this.log('GlueDevice was renamed');
+    this.logger.info(`Device was renamed to: ${name}`);
   }
 }
 

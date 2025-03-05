@@ -10,6 +10,15 @@ export const CONFIG = {
       MAX_ATTEMPTS: 3,
       INITIAL_DELAY: 1000,
       MAX_DELAY: 10000
+    },
+    // Add timeout configuration
+    TIMEOUT: 10000,
+    // Add longer timeout for lock/unlock operations
+    OPERATIONS_TIMEOUT: 15000,
+    // Add caching configuration
+    CACHE: {
+      ENABLED: true,
+      TTL: 30000 // 30 seconds cache lifetime
     }
   },
   POLLING: {
